@@ -1,0 +1,282 @@
+---
+title: "GISP all drugs"
+author: "Scott Olesen"
+output: html_document
+---
+
+```{r global_options, echo = FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  cache = TRUE, autodep = TRUE,
+  fig.path = 'fig/', dev = c('png', 'pdf')
+)
+
+library(dplyr)
+library(readr) # for read_tsv
+library(ggplot2)
+library(stats) # for nls
+library(knitr) # for making the R markdown doc
+library(forcats) # for fct_relevel
+library(purrr) # for map, map_dbl, etc.
+```
+
+# Antibiotic use
+
+```{r load_use_data}
+denom = read_tsv('../data/denom.tsv')
+
+counts = read_tsv('../data/abx_monthly_counts.tsv') %>%
+  # make Jan = 0
+  mutate(month = mon - 1) %>%
+  select(-mon)
+
+use_data = left_join(counts, denom, by = c('state', 'year')) %>%
+  # group by Census region
+  mutate(region = state.region[match(state, state.name)]) %>%
+  group_by(year, month, region, antibiotic) %>%
+  summarize_at(c('n_rx', 'n_member'), sum) %>%
+  ungroup() %>%
+  # claims per 1k people per year
+  mutate(ckpy = n_rx / n_member * 1000)
+```
+
+I group drugs into classes:
+
+- macolides (azi, clarithro, erythro)
+- quinolones (*xacin)
+- celaphosporins (cef-, ceph-)
+- tetracyclines (*cycline)
+- penicillins (amox, amox/clav, pen v, amp, diclox, pen g)
+
+```{r drug_class_seasonality}
+use_by_class = use_data %>%
+  mutate(class = case_when(
+    .$antibiotic %in% c('azithromycin', 'clarithromycin', 'erythromycin') ~ 'macrolide',
+    .$antibiotic %in% c('amoxicillin', 'amoxicillin/clavulanate', 'penicillin v', 'ampicillin', 'dicloxacillin', 'penicillin g') ~ 'penicillin',
+    str_detect(.$antibiotic, 'cycline$') ~ 'tetracycline',
+    str_detect(.$antibiotic, 'xacin$') ~ 'quinolone',
+    str_detect(.$antibiotic, '^ce[f|(ph)]') ~ 'cephalosporin',
+    TRUE ~ 'other'
+  )) %>%
+  filter(class != 'other') %>%
+  group_by(region, year, month, class) %>%
+  summarize_at('ckpy', sum) %>%
+  ungroup() %>%
+  mutate(
+    year_month = year + month / 12,
+    t = (year - min(year)) * 12 + month
+  )
+```
+
+By eye, it looks like there are seasonal patterns:
+
+```{r use_by_class_plot}
+use_by_class %>%
+  ggplot(aes(year_month, ckpy)) +
+  facet_wrap(~ region) +
+  geom_line(aes(color = class)) +
+  xlab('')
+```
+
+But there is also something fishy about the 2014-2015 merged: use seems to go up for all drugs, especially in the West. This might introduce some weird effects in the wavelet analysis.
+
+## Wavelet analysis
+
+To detect seasonality of antibiotic use, I do a wavelet analysis. I exclude the 2015 data because of the weird 2014-2015 jump, which introduces some weird stuff into the wavelets.
+
+```{r compute_use_wavelets, results = 'hide'}
+fence = function(x, lower, upper) pmax(lower, pmin(upper, x))
+
+wt_plot_data = function(w) {
+  with(w, {
+    crossing(i = seq_along(axis.1), j = seq_along(axis.2)) %>%
+      mutate(x = axis.1[i], y = axis.2[j],
+             scale = Scale[j],
+             amplitude = map2_dbl(j, i, ~ Ampl[.x, .y]),
+             power = map2_dbl(j, i, ~ Power[.x, .y]),
+             p.value = map2_dbl(j, i, ~ Power.pval[.x, .y]),
+             coi_raw = approx(coi.1, coi.2, x)$y,
+             coi = fence(coi_raw, min(y), max(y)),
+             sig = as.double(p.value < 0.05))
+  })
+}
+
+wavelet_region_class = use_by_class %>%
+  filter(year < 2015) %>%
+  nest(-region, -class) %>%
+  mutate(
+    wavelet = map(data, ~ WaveletComp::analyze.wavelet(., 'ckpy', verbose = FALSE)),
+    wavelet_plot_data = map(wavelet, wt_plot_data)
+  )
+```
+
+Dotted lines show 12 month periods. (The Northeast/tetracyclines has an extra line for 6 month period.) Solid black lines show regions with $p < 0.05$. Shaded areas along the side are the "cone of influence" where edge effects are important.
+
+```{r show_use_wavelets}
+# this is a kludge to make the x-axis look right. it should be drawn more directly
+# from the data.
+max_x = 47
+
+y_1yr = wavelet_region_class$wavelet_plot_data[[1]] %>%
+  mutate(d = abs(scale - 12)) %>%
+  filter(d == min(d)) %$%
+  unique(y)
+
+y_6mo = wavelet_region_class$wavelet_plot_data[[1]] %>%
+  mutate(d = abs(scale - 6)) %>%
+  filter(d == min(d)) %$%
+  unique(y)
+
+# make a dummy dataset
+ne_tet = data_frame(
+  region = 'Northeast', class = 'tetracycline',
+  x = 0, xend = max_x,
+  y = y_6mo, yend = y)
+
+wavelet_region_class %>%
+  select(region, class, wavelet_plot_data) %>%
+  unnest %>%
+  ggplot(aes(x - 1, y)) +
+  geom_tile(aes(fill = amplitude)) +
+  geom_ribbon(aes(ymin = coi, ymax = max(y)), alpha = 0.25) +
+  geom_contour(aes(z = as.double(p.value < 0.05)), color = 'black', size = 0.5, bins = 1) +
+  facet_grid(class ~ region) +
+  scale_fill_distiller(palette = 'RdYlBu') +
+  geom_segment(x = 1, xend = max_x + 1, y = 3.65, yend = 3.65, linetype = 2) +
+  geom_segment(data = ne_tet, aes(xend = xend - 1, y = y, yend = yend), linetype = 2) +
+  xlab('time (months since Jan 2005)') +
+  ylab('log2 period (months)') +
+  theme_minimal()
+```
+
+- In general, macrolides, penicillins, and quinolones are highly seasonal.
+- Cephalosporins are seasonal in the South and North Central (i.e., Midwest) and much less so in the Northeast and West.
+- Tetracyclines are weakly seasonal in North Central and West. In the Northeast, there is a 6-monthly seasonality.
+
+## Sinusoidal fits
+
+```{r use_data}
+omega = 2 * pi / 12
+
+use_nls_f = function(df) {
+  nls(ckpy ~ amplitude * sin(omega * (t - phase)) + offset,
+      start = list(amplitude = 1.0, phase = 0.0, offset = 10.0),
+      data = df)
+}
+
+peak_time = function(phase, amplitude) {
+  phase %>%
+    # add 3 because a sine's peak is 3 months after it's phase
+    { . + 3 } %>%
+    # if amplitude is negative, add another 6 months to flip the period
+    { if_else(amplitude < 0, . + 6, .) } %>%
+    # subtract whole years until you get to 0-12
+    { . %% 12 } %>%
+    # make it between -6 and +6
+    { if_else(. > 6, . - 12, .) }
+}
+
+use_by_class %>%
+  nest(-region, -class) %>%
+  mutate(
+    nls_model = map(data, use_nls_f),
+    raw_phase = map_dbl(nls_model, ~ coef(.)['phase']),
+    raw_amplitude = map_dbl(nls_model, ~ coef(.)['amplitude']),
+    amplitude_pval = map_dbl(nls_model, ~ coef(summary(.))['amplitude', 'Pr(>|t|)']),
+    amplitude_sig = p.adjust(amplitude_pval, 'BH') < 0.05,
+    peak = map2_dbl(raw_phase, raw_amplitude, peak_time),
+    amplitude = abs(raw_amplitude)
+  ) %>%
+  mutate(class = fct_reorder(class, -amplitude)) %>%
+  select(class, region, amplitude, amplitude_sig, peak) %>%
+  arrange(class, region) %>%
+  mutate_if(is.numeric, ~ round(., 3)) %>%
+  kable(caption = 'Sinusoidal fits to use data')
+```
+
+Use of every drug is yearly-seasonal, except for cephalosporins in the West and tetracyclines in the Northeast. I expect the Northeast tet thing has something to do with the 6-month cycle.
+
+### Tetracyclines
+
+When looking just at the tetracycline drugs, it's clear that minocycline (used to treat acne) is stable through the year, while doxycycline (used to treat Lyme disease, among other things) has more complicated seasonal dynamics:
+
+```{r tetracyclines}
+use_data %>%
+  filter(str_detect(antibiotic, 'cycline$')) %>%
+  mutate(year_month = year + month / 12) %>%
+  ggplot(aes(year_month, ckpy)) +
+  facet_wrap(~ region) +
+  geom_line(aes(color = antibiotic))
+```
+
+# Resistance
+
+```{r load_res_data}
+clinics = read_tsv('../db/gisp_sites.tsv') %>%
+  rename(clinic = abbreviation, state_abbreviation = state) %>%
+  mutate(state_id = match(state_abbreviation, state.abb),
+         region = state.region[state_id]) %>%
+  select(clinic, region)
+
+gisp = read_tsv('../../gisp/data/gisp.tsv') %>%
+  left_join(clinics, by = 'clinic') %>%
+  select(-week) %>%
+  gather('drug', 'mic', penicillin:azithromycin) %>%
+  filter(!is.na(mic)) %>%
+  # Jan -> 0, Feb -> 1, etc.
+  mutate(month = match(month, month.abb) - 1,
+         t = (year - min(year)) * 12 + month,
+         dil = round(log2(mic)),
+         clinic_year = str_c(clinic, '_', year)) %>%
+  group_by(clinic_year, drug) %>%
+  filter(n() >= 10) %>%
+  ungroup()
+
+# assert all months are between 0 and 11
+stopifnot(all(between(gisp$month, 0, 11)))
+```
+
+## Model fit
+
+This is where the model fits would go for the drugs beyond macrolides. The code is in the block below. The fits are fairly slow, so it's nice for development purposes to have some way to save the fit data and re-load it.
+
+```{r fit_resistance, eval = FALSE}
+nls_res_fit = function(df) {
+  n_cys = length(unique(df$clinic_year))
+
+  model_matrix = model.matrix(~ 0 + clinic_year, df) %>%
+    set_colnames(str_replace(colnames(.), '^clinic_year', ''))
+
+  stopifnot(dim(model_matrix) == c(nrow(df), n_cys))
+
+  # use clinic/year means as best start guess
+  start_intercepts = df %>%
+    group_by(clinic_year) %>%
+    summarize(value = mean(dil)) %>%
+    arrange(clinic_year) %T>%
+    # check that the order of these values matches the model matrix columns
+    { stopifnot(all(.$clinic_year == colnames(model_matrix))) } %>%
+    pull(value)
+  
+  # as a first guess for clinic/year slopes, use 0
+  start_slopes = rep(0, n_cys)
+  
+  start = list(A = 0.05, phase = 0.0, intercept = start_intercepts, slope = start_slopes)
+
+  # sinusoidal + linear fit function
+  fit_f = function(month, A, phase, slope, intercept) {
+    intercept_term = drop(model_matrix %*% intercept)
+    slope_term = drop(model_matrix %*% slope) * month
+    A * sin(2 * pi / 12 * (month - phase)) + slope_term + intercept_term
+  }
+
+  # fit the model
+  model = nls(dil ~ fit_f(month, A, phase, slope, intercept),
+              start = start,
+              data = df)
+  
+  model
+}
+```
+
+It might make sense to do models for each drug/region combination, since for some drugs it seems like use patterns vary by region.
