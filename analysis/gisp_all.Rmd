@@ -1,14 +1,14 @@
 ---
 title: "GISP all drugs"
 author: "Scott Olesen"
-output: html_document
+output: pdf_document
 ---
 
 ```{r global_options, echo = FALSE}
 knitr::opts_chunk$set(
   echo = FALSE, message = FALSE, warning = FALSE,
   cache = TRUE, autodep = TRUE,
-  fig.path = 'fig/', dev = c('png', 'pdf')
+  fig.path = 'fig/', dev = c('pdf', 'png')
 )
 
 library(dplyr)
